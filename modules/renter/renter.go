@@ -198,6 +198,8 @@ type Renter struct {
 	mu             *siasync.RWMutex
 	tg             threadgroup.ThreadGroup
 	tpool          modules.TransactionPool
+	chunkCache     map[string][]byte
+	cmu            *sync.Mutex
 }
 
 // Close closes the Renter and its dependencies
@@ -427,13 +429,10 @@ func newRenter(g modules.Gateway, cs modules.ConsensusSet, tpool modules.Transac
 		persistDir:     persistDir,
 		mu:             siasync.New(modules.SafeMutexDelay, 1),
 		tpool:          tpool,
+		chunkCache:     make(map[string][]byte),
+		cmu:            new(sync.Mutex),
 	}
 	r.memoryManager = newMemoryManager(defaultMemory, r.tg.StopChan())
-
-	// TODO those should not be global. Need a better way to cache streaming
-	// chunks.
-	cache = make(map[string][]byte)
-	cmu = new(sync.Mutex)
 
 	// Load all saved data.
 	if err := r.initPersist(); err != nil {
