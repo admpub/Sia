@@ -51,24 +51,24 @@ type (
 )
 
 func (t test5) MarshalSia(w io.Writer) error {
-	return WritePrefix(w, []byte(t.s))
+	return NewEncoder(w).WritePrefixedBytes([]byte(t.s))
 }
 
 func (t *test5) UnmarshalSia(r io.Reader) error {
-	b, err := ReadPrefix(r, 256)
-	t.s = string(b)
-	return err
+	d := NewDecoder(r)
+	t.s = string(d.ReadPrefixedBytes())
+	return d.Err()
 }
 
 // same as above methods, but with a pointer receiver
 func (t *test6) MarshalSia(w io.Writer) error {
-	return WritePrefix(w, []byte(t.s))
+	return NewEncoder(w).WritePrefixedBytes([]byte(t.s))
 }
 
 func (t *test6) UnmarshalSia(r io.Reader) error {
-	b, err := ReadPrefix(r, 256)
-	t.s = string(b)
-	return err
+	d := NewDecoder(r)
+	t.s = string(d.ReadPrefixedBytes())
+	return d.Err()
 }
 
 var testStructs = []interface{}{
@@ -148,20 +148,20 @@ func TestDecode(t *testing.T) {
 
 	// big slice (larger than MaxSliceSize)
 	err = Unmarshal(EncUint64(MaxSliceSize+1), new([]byte))
-	if err == nil || err.Error() != "could not decode type []uint8: encoded slice is too large" {
+	if err == nil || !strings.Contains(err.Error(), "exceeds size limit") {
 		t.Error("expected large slice error, got", err)
 	}
 
 	// massive slice (larger than MaxInt32)
 	err = Unmarshal(EncUint64(1<<32), new([]byte))
-	if err == nil || err.Error() != "could not decode type []uint8: encoded slice is too large" {
+	if err == nil || !strings.Contains(err.Error(), "exceeds size limit") {
 		t.Error("expected large slice error, got", err)
 	}
 
 	// many small slices (total larger than maxDecodeLen)
 	bigSlice := strings.Split(strings.Repeat("0123456789abcdefghijklmnopqrstuvwxyz", (MaxSliceSize/16)-1), "0")
 	err = Unmarshal(Marshal(bigSlice), new([]string))
-	if err == nil || err.Error() != "could not decode type []string: encoded object exceeds size limit" {
+	if err == nil || !strings.Contains(err.Error(), "exceeds size limit") {
 		t.Error("expected size limit error, got", err)
 	}
 
@@ -178,7 +178,6 @@ func TestDecode(t *testing.T) {
 	if err == nil || err.Error() != "could not decode type [3]uint8: EOF" {
 		t.Error("expected EOF error, got", err)
 	}
-
 }
 
 // TestMarshalUnmarshal tests the Marshal and Unmarshal functions, which are
@@ -358,6 +357,7 @@ func TestReadWriteFile(t *testing.T) {
 
 // i5-4670K, 9a90f86: 33 MB/s
 func BenchmarkEncode(b *testing.B) {
+	b.ReportAllocs()
 	buf := new(bytes.Buffer)
 	enc := NewEncoder(buf)
 	for i := 0; i < b.N; i++ {
@@ -374,6 +374,7 @@ func BenchmarkEncode(b *testing.B) {
 
 // i5-4670K, 9a90f86: 26 MB/s
 func BenchmarkDecode(b *testing.B) {
+	b.ReportAllocs()
 	var emptyStructs = []interface{}{&test0{}, &test1{}, &test2{}, &test3{}, &test4{}, &test5{}, &test6{}}
 	var numBytes int64
 	for i := 0; i < b.N; i++ {
@@ -391,6 +392,7 @@ func BenchmarkDecode(b *testing.B) {
 
 // i5-4670K, 2059112: 44 MB/s
 func BenchmarkMarshalAll(b *testing.B) {
+	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		_ = MarshalAll(testStructs...)
 	}
@@ -399,6 +401,7 @@ func BenchmarkMarshalAll(b *testing.B) {
 
 // i5-4670K, 2059112: 36 MB/s
 func BenchmarkUnmarshalAll(b *testing.B) {
+	b.ReportAllocs()
 	var emptyStructs = []interface{}{&test0{}, &test1{}, &test2{}, &test3{}, &test4{}, &test5{}, &test6{}}
 	structBytes := bytes.Join(testEncodings, nil)
 	for i := 0; i < b.N; i++ {

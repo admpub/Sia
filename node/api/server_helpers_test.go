@@ -73,7 +73,7 @@ func (srv *Server) Close() error {
 	for _, mod := range mods {
 		if mod.c != nil {
 			if closeErr := mod.c.Close(); closeErr != nil {
-				err = errors.Extend(err, fmt.Errorf("%v.Close failed: %v", mod.name, err))
+				err = errors.Extend(err, fmt.Errorf("%v.Close failed: %v", mod.name, closeErr))
 			}
 		}
 	}
@@ -165,7 +165,11 @@ func assembleServerTester(key crypto.TwofishKey, testdir string) (*serverTester,
 	if err != nil {
 		return nil, err
 	}
-	if !w.Encrypted() {
+	encrypted, err := w.Encrypted()
+	if err != nil {
+		return nil, err
+	}
+	if !encrypted {
 		_, err = w.Encrypt(key)
 		if err != nil {
 			return nil, err
@@ -245,7 +249,11 @@ func assembleAuthenticatedServerTester(requiredPassword string, key crypto.Twofi
 	if err != nil {
 		return nil, err
 	}
-	if !w.Encrypted() {
+	encrypted, err := w.Encrypted()
+	if err != nil {
+		return nil, err
+	}
+	if !encrypted {
 		_, err = w.Encrypt(key)
 		if err != nil {
 			return nil, err
@@ -458,20 +466,6 @@ func non2xx(code int) bool {
 // with the error.
 func (st *serverTester) panicClose() {
 	st.server.panicClose()
-}
-
-// retry will retry a function multiple times until it returns 'nil'. It will
-// sleep the specified duration between tries. If success is not achieved in the
-// specified number of attempts, the final error is returned.
-func retry(tries int, durationBetweenAttempts time.Duration, fn func() error) (err error) {
-	for i := 0; i < tries-1; i++ {
-		err = fn()
-		if err == nil {
-			return nil
-		}
-		time.Sleep(durationBetweenAttempts)
-	}
-	return fn()
 }
 
 // reloadedServerTester creates a server tester where all of the persistent

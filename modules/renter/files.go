@@ -2,6 +2,7 @@ package renter
 
 import (
 	"errors"
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
@@ -36,6 +37,7 @@ type file struct {
 	erasureCode modules.ErasureCoder // Static - can be accessed without lock.
 	pieceSize   uint64               // Static - can be accessed without lock.
 	mode        uint32               // actually an os.FileMode
+	deleted     bool                 // indicates if the file has been deleted.
 
 	staticUID string // A UID assigned to the file when it gets created.
 
@@ -88,10 +90,10 @@ func (f *file) numChunks() uint64 {
 }
 
 // available indicates whether the file is ready to be downloaded.
-func (f *file) available(contractStatus func(types.FileContractID) (offline bool, goodForRenew bool)) bool {
+func (f *file) available(offline map[types.FileContractID]bool) bool {
 	chunkPieces := make([]int, f.numChunks())
 	for _, fc := range f.contracts {
-		if offline, _ := contractStatus(fc.ID); offline {
+		if offline[fc.ID] {
 			continue
 		}
 		for _, p := range fc.Pieces {
@@ -134,7 +136,7 @@ func (f *file) uploadProgress() float64 {
 // becomes available when this redundancy is >= 1. Assumes that every piece is
 // unique within a file contract. -1 is returned if the file has size 0. It
 // takes one argument, a map of offline contracts for this file.
-func (f *file) redundancy(contractStatus func(types.FileContractID) (bool, bool)) float64 {
+func (f *file) redundancy(offlineMap map[types.FileContractID]bool, goodForRenewMap map[types.FileContractID]bool) float64 {
 	if f.size == 0 {
 		return -1
 	}
@@ -147,14 +149,40 @@ func (f *file) redundancy(contractStatus func(types.FileContractID) (bool, bool)
 		build.Critical("cannot get redundancy of a file with 0 chunks")
 		return -1
 	}
+	// pieceRenewMap stores each encountered piece and a boolean to indicate if
+	// that piece was already encountered on a goodForRenew contract.
+	pieceRenewMap := make(map[string]bool)
 	for _, fc := range f.contracts {
-		offline, goodForRenew := contractStatus(fc.ID)
+		offline, exists1 := offlineMap[fc.ID]
+		goodForRenew, exists2 := goodForRenewMap[fc.ID]
+		if exists1 != exists2 {
+			build.Critical("contract can't be in one map but not in the other")
+		}
+		if !exists1 {
+			continue
+		}
 
 		// do not count pieces from the contract if the contract is offline
 		if offline {
 			continue
 		}
 		for _, p := range fc.Pieces {
+			pieceKey := fmt.Sprintf("%v/%v", p.Chunk, p.Piece)
+			// If the piece is redundant we need to check if the same piece was
+			// encountered on a goodForRenew contract before. If it wasn't we
+			// need to increase the piecesPerChunk counter and set the value of
+			// the pieceKey entry to true. Otherwise we just ignore the piece.
+			if gfr, redundant := pieceRenewMap[pieceKey]; redundant && gfr {
+				continue
+			} else if redundant && !gfr {
+				pieceRenewMap[pieceKey] = true
+				piecesPerChunk[p.Chunk]++
+				continue
+			}
+			pieceRenewMap[pieceKey] = goodForRenew
+
+			// If the contract is goodForRenew, increment the entry in both
+			// maps. If not, only the one in piecesPerChunkNoRenew.
 			if goodForRenew {
 				piecesPerChunk[p.Chunk]++
 			}
@@ -232,7 +260,7 @@ func (r *Renter) DeleteFile(nickname string) error {
 		return ErrUnknownPath
 	}
 	delete(r.files, nickname)
-	delete(r.tracking, nickname)
+	delete(r.persist.Tracking, nickname)
 
 	err := persist.RemoveFile(filepath.Join(r.persistDir, f.name+ShareExtension))
 	if err != nil {
@@ -246,6 +274,9 @@ func (r *Renter) DeleteFile(nickname string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
+	// mark the file as deleted
+	f.deleted = true
+
 	// TODO: delete the sectors of the file as well.
 
 	return nil
@@ -253,28 +284,42 @@ func (r *Renter) DeleteFile(nickname string) error {
 
 // FileList returns all of the files that the renter has.
 func (r *Renter) FileList() []modules.FileInfo {
+	// Get all the files and their contracts
 	var files []*file
+	contractIDs := make(map[types.FileContractID]struct{})
 	lockID := r.mu.RLock()
 	for _, f := range r.files {
 		files = append(files, f)
+		f.mu.RLock()
+		for cid := range f.contracts {
+			contractIDs[cid] = struct{}{}
+		}
+		f.mu.RUnlock()
 	}
 	r.mu.RUnlock(lockID)
 
-	contractStatus := func(id types.FileContractID) (offline bool, goodForRenew bool) {
-		id = r.hostContractor.ResolveID(id)
-		cu, ok := r.hostContractor.ContractUtility(id)
-		offline = r.hostContractor.IsOffline(id)
-		goodForRenew = ok && cu.GoodForRenew
-		return
+	// Build 2 maps that map every contract id to its offline and goodForRenew
+	// status.
+	goodForRenew := make(map[types.FileContractID]bool)
+	offline := make(map[types.FileContractID]bool)
+	for cid := range contractIDs {
+		resolvedKey := r.hostContractor.ResolveIDToPubKey(cid)
+		cu, ok := r.hostContractor.ContractUtility(resolvedKey)
+		if !ok {
+			continue
+		}
+		goodForRenew[cid] = ok && cu.GoodForRenew
+		offline[cid] = r.hostContractor.IsOffline(resolvedKey)
 	}
 
-	var fileList []modules.FileInfo
+	// Build the list of FileInfos.
+	fileList := []modules.FileInfo{}
 	for _, f := range files {
 		lockID := r.mu.RLock()
 		f.mu.RLock()
 		renewing := true
 		var localPath string
-		tf, exists := r.tracking[f.name]
+		tf, exists := r.persist.Tracking[f.name]
 		if exists {
 			localPath = tf.RepairPath
 		}
@@ -283,8 +328,8 @@ func (r *Renter) FileList() []modules.FileInfo {
 			LocalPath:      localPath,
 			Filesize:       f.size,
 			Renewing:       renewing,
-			Available:      f.available(contractStatus),
-			Redundancy:     f.redundancy(contractStatus),
+			Available:      f.available(offline),
+			Redundancy:     f.redundancy(offline, goodForRenew),
 			UploadedBytes:  f.uploadedBytes(),
 			UploadProgress: f.uploadProgress(),
 			Expiration:     f.expiration(),
@@ -293,6 +338,61 @@ func (r *Renter) FileList() []modules.FileInfo {
 		r.mu.RUnlock(lockID)
 	}
 	return fileList
+}
+
+// File returns file from siaPath queried by user.
+// Update based on FileList
+func (r *Renter) File(siaPath string) (modules.FileInfo, error) {
+	var fileInfo modules.FileInfo
+
+	// Get the file and its contracts
+	contractIDs := make(map[types.FileContractID]struct{})
+	lockID := r.mu.RLock()
+	defer r.mu.RUnlock(lockID)
+	file, exists := r.files[siaPath]
+	if !exists {
+		return fileInfo, ErrUnknownPath
+	}
+	file.mu.RLock()
+	defer file.mu.RUnlock()
+	for cid := range file.contracts {
+		contractIDs[cid] = struct{}{}
+	}
+
+	// Build 2 maps that map every contract id to its offline and goodForRenew
+	// status.
+	goodForRenew := make(map[types.FileContractID]bool)
+	offline := make(map[types.FileContractID]bool)
+	for cid := range contractIDs {
+		resolvedKey := r.hostContractor.ResolveIDToPubKey(cid)
+		cu, ok := r.hostContractor.ContractUtility(resolvedKey)
+		if !ok {
+			continue
+		}
+		goodForRenew[cid] = ok && cu.GoodForRenew
+		offline[cid] = r.hostContractor.IsOffline(resolvedKey)
+	}
+
+	// Build the FileInfo
+	renewing := true
+	var localPath string
+	tf, exists := r.persist.Tracking[file.name]
+	if exists {
+		localPath = tf.RepairPath
+	}
+	fileInfo = modules.FileInfo{
+		SiaPath:        file.name,
+		LocalPath:      localPath,
+		Filesize:       file.size,
+		Renewing:       renewing,
+		Available:      file.available(offline),
+		Redundancy:     file.redundancy(offline, goodForRenew),
+		UploadedBytes:  file.uploadedBytes(),
+		UploadProgress: file.uploadProgress(),
+		Expiration:     file.expiration(),
+	}
+
+	return fileInfo, nil
 }
 
 // RenameFile takes an existing file and changes the nickname. The original
@@ -329,9 +429,9 @@ func (r *Renter) RenameFile(currentName, newName string) error {
 	// Update the entries in the renter.
 	delete(r.files, currentName)
 	r.files[newName] = file
-	if t, ok := r.tracking[currentName]; ok {
-		delete(r.tracking, currentName)
-		r.tracking[newName] = t
+	if t, ok := r.persist.Tracking[currentName]; ok {
+		delete(r.persist.Tracking, currentName)
+		r.persist.Tracking[newName] = t
 	}
 	err = r.saveSync()
 	if err != nil {

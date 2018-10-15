@@ -1,7 +1,6 @@
 package contractor
 
 import (
-	"errors"
 	"testing"
 	"time"
 
@@ -9,10 +8,12 @@ import (
 	"github.com/NebulousLabs/Sia/crypto"
 	"github.com/NebulousLabs/Sia/modules"
 	"github.com/NebulousLabs/Sia/types"
+
+	"github.com/NebulousLabs/errors"
 	"github.com/NebulousLabs/fastrand"
 )
 
-// TestIntegrationAutoRenew tests that contracts are automatically renwed at
+// TestIntegrationAutoRenew tests that contracts are automatically renewed at
 // the expected block height.
 func TestIntegrationAutoRenew(t *testing.T) {
 	if testing.Short() {
@@ -48,7 +49,7 @@ func TestIntegrationAutoRenew(t *testing.T) {
 	contract := c.Contracts()[0]
 
 	// revise the contract
-	editor, err := c.Editor(contract.ID, nil)
+	editor, err := c.Editor(contract.HostPublicKey, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,8 +79,9 @@ func TestIntegrationAutoRenew(t *testing.T) {
 
 	// check renewed contract
 	contract = c.Contracts()[0]
-	if contract.EndHeight != c.blockHeight+c.allowance.Period {
-		t.Fatal("wrong window start:", contract.EndHeight)
+	endHeight := c.CurrentPeriod() + c.allowance.Period
+	if contract.EndHeight != endHeight {
+		t.Fatalf("Wrong end height, expected %v got %v\n", endHeight, contract.EndHeight)
 	}
 }
 
@@ -119,7 +121,7 @@ func TestIntegrationRenewInvalidate(t *testing.T) {
 	contract := c.Contracts()[0]
 
 	// revise the contract
-	editor, err := c.Editor(contract.ID, nil)
+	editor, err := c.Editor(contract.HostPublicKey, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,9 +147,10 @@ func TestIntegrationRenewInvalidate(t *testing.T) {
 
 	// check renewed contract
 	contract = c.Contracts()[0]
+	endHeight := c.CurrentPeriod() + c.allowance.Period
 	c.mu.Lock()
-	if contract.EndHeight != c.blockHeight+c.allowance.Period {
-		t.Error("wrong window start:", contract.EndHeight)
+	if contract.EndHeight != endHeight {
+		t.Fatalf("Wrong end height, expected %v got %v\n", endHeight, contract.EndHeight)
 	}
 	c.mu.Unlock()
 
@@ -159,7 +162,7 @@ func TestIntegrationRenewInvalidate(t *testing.T) {
 	editor.Close()
 
 	// create a downloader
-	downloader, err := c.Downloader(contract.ID, nil)
+	downloader, err := c.Downloader(contract.HostPublicKey, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -171,15 +174,19 @@ func TestIntegrationRenewInvalidate(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	// wait for goroutine in ProcessConsensusChange to finish
-	time.Sleep(100 * time.Millisecond)
-	c.maintenanceLock.Lock()
-	c.maintenanceLock.Unlock()
 
 	// downloader should have been invalidated
-	_, err = downloader.Sector(crypto.Hash{})
-	if err != errInvalidDownloader {
-		t.Error("expected invalid downloader error; got", err)
+	err = build.Retry(50, 100*time.Millisecond, func() error {
+		// wait for goroutine in ProcessConsensusChange to finish
+		c.maintenanceLock.Lock()
+		c.maintenanceLock.Unlock()
+		_, err2 := downloader.Sector(crypto.Hash{})
+		if err2 != errInvalidDownloader {
+			return errors.AddContext(err, "expected invalid downloader error")
+		}
+		return downloader.Close()
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
-	downloader.Close()
 }

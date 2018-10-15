@@ -1,25 +1,20 @@
 package proto
 
 import (
-	"errors"
 	"net"
 
 	"github.com/NebulousLabs/Sia/crypto"
 	"github.com/NebulousLabs/Sia/encoding"
 	"github.com/NebulousLabs/Sia/modules"
 	"github.com/NebulousLabs/Sia/types"
-)
 
-const (
-	// estTxnSize is the estimated size of an encoded file contract
-	// transaction set.
-	estTxnSize = 2048
+	"github.com/NebulousLabs/errors"
 )
 
 // FormContract forms a contract with a host and submits the contract
 // transaction to tpool. The contract is added to the ContractSet and its
 // metadata is returned.
-func (cs *ContractSet) FormContract(params ContractParams, txnBuilder transactionBuilder, tpool transactionPool, hdb hostDB, cancel <-chan struct{}) (modules.RenterContract, error) {
+func (cs *ContractSet) FormContract(params ContractParams, txnBuilder transactionBuilder, tpool transactionPool, hdb hostDB, cancel <-chan struct{}) (rc modules.RenterContract, err error) {
 	// Extract vars from params, for convenience.
 	host, funding, startHeight, endHeight, refundAddress := params.Host, params.Funding, params.StartHeight, params.EndHeight, params.RefundAddress
 
@@ -36,7 +31,7 @@ func (cs *ContractSet) FormContract(params ContractParams, txnBuilder transactio
 
 	// Calculate the anticipated transaction fee.
 	_, maxFee := tpool.FeeEstimation()
-	txnFee := maxFee.Mul64(estTxnSize)
+	txnFee := maxFee.Mul64(modules.EstimatedFileContractTransactionSetSize)
 
 	// Underflow check.
 	if funding.Cmp(host.ContractPrice.Add(txnFee)) <= 0 {
@@ -88,7 +83,7 @@ func (cs *ContractSet) FormContract(params ContractParams, txnBuilder transactio
 	}
 
 	// Build transaction containing fc, e.g. the File Contract.
-	err := txnBuilder.FundSiacoins(funding)
+	err = txnBuilder.FundSiacoins(funding)
 	if err != nil {
 		return modules.RenterContract{}, err
 	}
@@ -98,12 +93,17 @@ func (cs *ContractSet) FormContract(params ContractParams, txnBuilder transactio
 
 	// Create initial transaction set.
 	txn, parentTxns := txnBuilder.View()
-	txnSet := append(parentTxns, txn)
+	unconfirmedParents, err := txnBuilder.UnconfirmedParents()
+	if err != nil {
+		return modules.RenterContract{}, err
+	}
+	txnSet := append(unconfirmedParents, append(parentTxns, txn)...)
 
 	// Increase Successful/Failed interactions accordingly
 	defer func() {
 		if err != nil {
 			hdb.IncrementFailedInteractions(host.PublicKey)
+			err = errors.Extend(err, modules.ErrHostFault)
 		} else {
 			hdb.IncrementSuccessfulInteractions(host.PublicKey)
 		}
@@ -270,6 +270,10 @@ func (cs *ContractSet) FormContract(params ContractParams, txnBuilder transactio
 		ContractFee: host.ContractPrice,
 		TxnFee:      txnFee,
 		SiafundFee:  types.Tax(startHeight, fc.Payout),
+		Utility: modules.ContractUtility{
+			GoodForUpload: true,
+			GoodForRenew:  true,
+		},
 	}
 
 	// Add contract to set.

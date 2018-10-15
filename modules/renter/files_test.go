@@ -44,9 +44,7 @@ func TestFileAvailable(t *testing.T) {
 		erasureCode: rsc,
 		pieceSize:   100,
 	}
-	neverOffline := func(types.FileContractID) (bool, bool) {
-		return false, true
-	}
+	neverOffline := make(map[types.FileContractID]bool)
 
 	if f.available(neverOffline) {
 		t.Error("file should not be available")
@@ -62,9 +60,8 @@ func TestFileAvailable(t *testing.T) {
 		t.Error("file should be available")
 	}
 
-	specificOffline := func(fcid types.FileContractID) (bool, bool) {
-		return fcid == fc.ID, true
-	}
+	specificOffline := make(map[types.FileContractID]bool)
+	specificOffline[fc.ID] = true
 	if f.available(specificOffline) {
 		t.Error("file should not be available")
 	}
@@ -109,9 +106,13 @@ func TestFileUploadProgressPinning(t *testing.T) {
 // with varying number of filecontracts and erasure code settings.
 func TestFileRedundancy(t *testing.T) {
 	nDatas := []int{1, 2, 10}
-	neverOffline := func(types.FileContractID) (bool, bool) {
-		return false, true
+	neverOffline := make(map[types.FileContractID]bool)
+	goodForRenew := make(map[types.FileContractID]bool)
+	for i := 0; i < 5; i++ {
+		neverOffline[types.FileContractID{byte(i)}] = false
+		goodForRenew[types.FileContractID{byte(i)}] = true
 	}
+
 	for _, nData := range nDatas {
 		rsc, _ := NewRSCode(nData, 10)
 		f := &file{
@@ -121,7 +122,7 @@ func TestFileRedundancy(t *testing.T) {
 			erasureCode: rsc,
 		}
 		// Test that an empty file has 0 redundancy.
-		if r := f.redundancy(neverOffline); r != 0 {
+		if r := f.redundancy(neverOffline, goodForRenew); r != 0 {
 			t.Error("expected 0 redundancy, got", r)
 		}
 		// Test that a file with 1 filecontract that has a piece for every chunk but
@@ -137,7 +138,7 @@ func TestFileRedundancy(t *testing.T) {
 			fc.Pieces = append(fc.Pieces, pd)
 		}
 		f.contracts[fc.ID] = fc
-		if r := f.redundancy(neverOffline); r != 0 {
+		if r := f.redundancy(neverOffline, goodForRenew); r != 0 {
 			t.Error("expected 0 redundancy, got", r)
 		}
 		// Test that adding another filecontract with a piece for every chunk but one
@@ -153,7 +154,7 @@ func TestFileRedundancy(t *testing.T) {
 			fc.Pieces = append(fc.Pieces, pd)
 		}
 		f.contracts[fc.ID] = fc
-		if r := f.redundancy(neverOffline); r != 0 {
+		if r := f.redundancy(neverOffline, goodForRenew); r != 0 {
 			t.Error("expected 0 redundancy, got", r)
 		}
 		// Test that adding a file contract with a piece for the missing chunk
@@ -169,7 +170,7 @@ func TestFileRedundancy(t *testing.T) {
 		f.contracts[fc.ID] = fc
 		// 1.0 / MinPieces because the chunk with the least number of pieces has 1 piece.
 		expectedR := 1.0 / float64(f.erasureCode.MinPieces())
-		if r := f.redundancy(neverOffline); r != expectedR {
+		if r := f.redundancy(neverOffline, goodForRenew); r != expectedR {
 			t.Errorf("expected %f redundancy, got %f", expectedR, r)
 		}
 		// Test that adding a file contract that has erasureCode.MinPieces() pieces
@@ -181,14 +182,15 @@ func TestFileRedundancy(t *testing.T) {
 			for iPiece := uint64(0); iPiece < uint64(f.erasureCode.MinPieces()); iPiece++ {
 				fc.Pieces = append(fc.Pieces, pieceData{
 					Chunk: iChunk,
-					Piece: iPiece,
+					// add 1 since the same piece can't count towards redundancy twice.
+					Piece: iPiece + 1,
 				})
 			}
 		}
 		f.contracts[fc.ID] = fc
 		// 1+MinPieces / MinPieces because the chunk with the least number of pieces has 1+MinPieces pieces.
 		expectedR = float64(1+f.erasureCode.MinPieces()) / float64(f.erasureCode.MinPieces())
-		if r := f.redundancy(neverOffline); r != expectedR {
+		if r := f.redundancy(neverOffline, goodForRenew); r != expectedR {
 			t.Errorf("expected %f redundancy, got %f", expectedR, r)
 		}
 
@@ -205,10 +207,12 @@ func TestFileRedundancy(t *testing.T) {
 			}
 		}
 		f.contracts[fc.ID] = fc
-		specificOffline := func(fcid types.FileContractID) (bool, bool) {
-			return fcid == fc.ID, true
+		specificOffline := make(map[types.FileContractID]bool)
+		for fcid := range goodForRenew {
+			specificOffline[fcid] = false
 		}
-		if r := f.redundancy(specificOffline); r != expectedR {
+		specificOffline[fc.ID] = true
+		if r := f.redundancy(specificOffline, goodForRenew); r != expectedR {
 			t.Errorf("expected redundancy to ignore offline file contracts, wanted %f got %f", expectedR, r)
 		}
 	}
@@ -262,7 +266,7 @@ func TestRenterFileListLocalPath(t *testing.T) {
 	f := newTestingFile()
 	f.name = "testname"
 	rt.renter.files["test"] = f
-	rt.renter.tracking[f.name] = trackedFile{
+	rt.renter.persist.Tracking[f.name] = trackedFile{
 		RepairPath: "TestPath",
 	}
 	rt.renter.mu.Unlock(id)
@@ -438,13 +442,13 @@ func TestRenterRenameFile(t *testing.T) {
 	}
 
 	// Renaming should also update the tracking set
-	rt.renter.tracking["1"] = trackedFile{"foo"}
+	rt.renter.persist.Tracking["1"] = trackedFile{"foo"}
 	err = rt.renter.RenameFile("1", "1b")
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, oldexists := rt.renter.tracking["1"]
-	_, newexists := rt.renter.tracking["1b"]
+	_, oldexists := rt.renter.persist.Tracking["1"]
+	_, newexists := rt.renter.persist.Tracking["1b"]
 	if oldexists || !newexists {
 		t.Error("renaming should have updated the entry in the tracking set")
 	}

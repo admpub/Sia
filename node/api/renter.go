@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"path/filepath"
-	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -115,12 +115,20 @@ type (
 
 	// RenterContracts contains the renter's contracts.
 	RenterContracts struct {
-		Contracts []RenterContract `json:"contracts"`
+		Contracts         []RenterContract `json:"contracts"`
+		ActiveContracts   []RenterContract `json:"activecontracts"`
+		InactiveContracts []RenterContract `json:"inactivecontracts"`
+		ExpiredContracts  []RenterContract `json:"expiredcontracts"`
 	}
 
 	// RenterDownloadQueue contains the renter's download queue.
 	RenterDownloadQueue struct {
 		Downloads []DownloadInfo `json:"downloads"`
+	}
+
+	// RenterFile lists the file queried.
+	RenterFile struct {
+		File modules.FileInfo `json:"file"`
 	}
 
 	// RenterFiles lists the files known to the renter.
@@ -158,6 +166,7 @@ type (
 		Error                string    `json:"error"`                // Will be the empty string unless there was an error.
 		Received             uint64    `json:"received"`             // Amount of data confirmed and decoded.
 		StartTime            time.Time `json:"starttime"`            // The time when the download was started.
+		StartTimeUnix        int64     `json:"starttimeunix"`        // The time when the download was started in unix format.
 		TotalDataTransferred uint64    `json:"totaldatatransferred"` // The total amount of data transferred, including negotiation, overdrive etc.
 	}
 )
@@ -248,6 +257,15 @@ func (api *API) renterHandlerPOST(w http.ResponseWriter, req *http.Request, _ ht
 		}
 		settings.MaxUploadSpeed = uploadSpeed
 	}
+	// Scan the stream cache size. (optional parameter)
+	if dcs := req.FormValue("streamcachesize"); dcs != "" {
+		var streamCacheSize uint64
+		if _, err := fmt.Sscan(dcs, &streamCacheSize); err != nil {
+			WriteError(w, Error{"unable to parse streamcachesize: " + err.Error()}, http.StatusBadRequest)
+			return
+		}
+		settings.StreamCacheSize = streamCacheSize
+	}
 	// Set the settings in the renter.
 	err := api.renter.SetSettings(settings)
 	if err != nil {
@@ -257,9 +275,36 @@ func (api *API) renterHandlerPOST(w http.ResponseWriter, req *http.Request, _ ht
 	WriteSuccess(w)
 }
 
-// renterContractsHandler handles the API call to request the Renter's contracts.
-func (api *API) renterContractsHandler(w http.ResponseWriter, _ *http.Request, _ httprouter.Params) {
+// renterContractsHandler handles the API call to request the Renter's
+// contracts.
+//
+// Active contracts are contracts that the renter is actively using to store
+// data and can upload, download, and renew
+//
+// Inactive contracts are contracts that are not currently being used by the
+// renter because they are !goodForRenew, but have endheights that are in the
+// future so could potentially become active again
+//
+// Expired contracts are contracts who's endheights are in the past
+func (api *API) renterContractsHandler(w http.ResponseWriter, req *http.Request, _ httprouter.Params) {
+	// Parse flags
+	inactive, err := scanBool(req.FormValue("inactive"))
+	if err != nil {
+		return
+	}
+	expired, err := scanBool(req.FormValue("expired"))
+	if err != nil {
+		return
+	}
+
+	// Get current block height for reference
+	blockHeight := api.cs.Height()
+
+	// Get active contracts
 	contracts := []RenterContract{}
+	activeContracts := []RenterContract{}
+	inactiveContracts := []RenterContract{}
+	expiredContracts := []RenterContract{}
 	for _, c := range api.renter.Contracts() {
 		var size uint64
 		if len(c.Transaction.FileContractRevisions) != 0 {
@@ -276,12 +321,11 @@ func (api *API) renterContractsHandler(w http.ResponseWriter, _ *http.Request, _
 		// Fetch utilities for contract
 		var goodForUpload bool
 		var goodForRenew bool
-		if utility, ok := api.renter.ContractUtility(c.ID); ok {
+		if utility, ok := api.renter.ContractUtility(c.HostPublicKey); ok {
 			goodForUpload = utility.GoodForUpload
 			goodForRenew = utility.GoodForRenew
 		}
-
-		contracts = append(contracts, RenterContract{
+		contract := RenterContract{
 			DownloadSpending:          c.DownloadSpending,
 			EndHeight:                 c.EndHeight,
 			Fees:                      c.TxnFee.Add(c.SiafundFee).Add(c.ContractFee),
@@ -298,11 +342,100 @@ func (api *API) renterContractsHandler(w http.ResponseWriter, _ *http.Request, _
 			StorageSpendingDeprecated: c.StorageSpending,
 			TotalCost:                 c.TotalCost,
 			UploadSpending:            c.UploadSpending,
-		})
+		}
+		if goodForRenew {
+			activeContracts = append(activeContracts, contract)
+		} else if inactive && !goodForRenew {
+			inactiveContracts = append(inactiveContracts, contract)
+		}
+		contracts = append(contracts, contract)
 	}
+
+	// Get expired contracts
+	if expired || inactive {
+		for _, c := range api.renter.OldContracts() {
+			var size uint64
+			if len(c.Transaction.FileContractRevisions) != 0 {
+				size = c.Transaction.FileContractRevisions[0].NewFileSize
+			}
+
+			// Fetch host address
+			var netAddress modules.NetAddress
+			hdbe, exists := api.renter.Host(c.HostPublicKey)
+			if exists {
+				netAddress = hdbe.NetAddress
+			}
+
+			// Fetch utilities for contract
+			var goodForUpload bool
+			var goodForRenew bool
+			if utility, ok := api.renter.ContractUtility(c.HostPublicKey); ok {
+				goodForUpload = utility.GoodForUpload
+				goodForRenew = utility.GoodForRenew
+			}
+
+			contract := RenterContract{
+				DownloadSpending:          c.DownloadSpending,
+				EndHeight:                 c.EndHeight,
+				Fees:                      c.TxnFee.Add(c.SiafundFee).Add(c.ContractFee),
+				GoodForUpload:             goodForUpload,
+				GoodForRenew:              goodForRenew,
+				HostPublicKey:             c.HostPublicKey,
+				ID:                        c.ID,
+				LastTransaction:           c.Transaction,
+				NetAddress:                netAddress,
+				RenterFunds:               c.RenterFunds,
+				Size:                      size,
+				StartHeight:               c.StartHeight,
+				StorageSpending:           c.StorageSpending,
+				StorageSpendingDeprecated: c.StorageSpending,
+				TotalCost:                 c.TotalCost,
+				UploadSpending:            c.UploadSpending,
+			}
+			if expired && c.EndHeight < blockHeight {
+				expiredContracts = append(expiredContracts, contract)
+			} else if inactive && c.EndHeight >= blockHeight {
+				inactiveContracts = append(inactiveContracts, contract)
+			}
+		}
+	}
+
 	WriteJSON(w, RenterContracts{
-		Contracts: contracts,
+		Contracts:         contracts,
+		ActiveContracts:   activeContracts,
+		InactiveContracts: inactiveContracts,
+		ExpiredContracts:  expiredContracts,
 	})
+}
+
+// renterClearDownloadsHandler handles the API call to request to clear the download queue.
+func (api *API) renterClearDownloadsHandler(w http.ResponseWriter, req *http.Request, _ httprouter.Params) {
+	var afterTime time.Time
+	beforeTime := types.EndOfTime
+	beforeStr, afterStr := req.FormValue("before"), req.FormValue("after")
+	if beforeStr != "" {
+		beforeInt, err := strconv.ParseInt(beforeStr, 10, 64)
+		if err != nil {
+			WriteError(w, Error{"parsing integer value for parameter `before` failed: " + err.Error()}, http.StatusBadRequest)
+			return
+		}
+		beforeTime = time.Unix(0, beforeInt)
+	}
+	if afterStr != "" {
+		afterInt, err := strconv.ParseInt(afterStr, 10, 64)
+		if err != nil {
+			WriteError(w, Error{"parsing integer value for parameter `after` failed: " + err.Error()}, http.StatusBadRequest)
+			return
+		}
+		afterTime = time.Unix(0, afterInt)
+	}
+
+	err := api.renter.ClearDownloadHistory(afterTime, beforeTime)
+	if err != nil {
+		WriteError(w, Error{err.Error()}, http.StatusBadRequest)
+		return
+	}
+	WriteSuccess(w)
 }
 
 // renterDownloadsHandler handles the API call to request the download queue.
@@ -322,11 +455,10 @@ func (api *API) renterDownloadsHandler(w http.ResponseWriter, _ *http.Request, _
 			Error:                di.Error,
 			Received:             di.Received,
 			StartTime:            di.StartTime,
+			StartTimeUnix:        di.StartTimeUnix,
 			TotalDataTransferred: di.TotalDataTransferred,
 		})
 	}
-	// sort the downloads by newest first
-	sort.Slice(downloads, func(i, j int) bool { return downloads[i].StartTime.After(downloads[j].StartTime) })
 	WriteJSON(w, RenterDownloadQueue{
 		Downloads: downloads,
 	})
@@ -373,6 +505,18 @@ func (api *API) renterRenameHandler(w http.ResponseWriter, req *http.Request, ps
 	WriteSuccess(w)
 }
 
+// renterFileHandler handles the API call to return specific file.
+func (api *API) renterFileHandler(w http.ResponseWriter, req *http.Request, ps httprouter.Params) {
+	file, err := api.renter.File(strings.TrimPrefix(ps.ByName("siapath"), "/"))
+	if err != nil {
+		WriteError(w, Error{err.Error()}, http.StatusBadRequest)
+		return
+	}
+	WriteJSON(w, RenterFile{
+		File: file,
+	})
+}
+
 // renterFilesHandler handles the API call to list all of the files.
 func (api *API) renterFilesHandler(w http.ResponseWriter, req *http.Request, _ httprouter.Params) {
 	WriteJSON(w, RenterFiles{
@@ -407,30 +551,15 @@ func (api *API) renterDownloadHandler(w http.ResponseWriter, req *http.Request, 
 		WriteError(w, Error{err.Error()}, http.StatusBadRequest)
 		return
 	}
-
-	if params.Async { // Create goroutine if `async` param set.
-		// check for errors for 5 seconds to catch validation errors (no file with
-		// that path, invalid parameters, insufficient hosts, etc)
-		errchan := make(chan error)
-		go func() {
-			errchan <- api.renter.Download(params)
-		}()
-		select {
-		case err = <-errchan:
-			if err != nil {
-				WriteError(w, Error{"download failed: " + err.Error()}, http.StatusInternalServerError)
-				return
-			}
-		case <-time.After(time.Millisecond * 100):
-		}
+	if params.Async {
+		err = api.renter.DownloadAsync(params)
 	} else {
-		err := api.renter.Download(params)
-		if err != nil {
-			WriteError(w, Error{"download failed: " + err.Error()}, http.StatusInternalServerError)
-			return
-		}
+		err = api.renter.Download(params)
 	}
-
+	if err != nil {
+		WriteError(w, Error{"download failed: " + err.Error()}, http.StatusInternalServerError)
+		return
+	}
 	if params.Httpwriter == nil {
 		// `httpresp=true` causes writes to w before this line is run, automatically
 		// adding `200 Status OK` code to response. Calling this results in a
@@ -539,6 +668,18 @@ func (api *API) renterShareASCIIHandler(w http.ResponseWriter, req *http.Request
 	})
 }
 
+// renterStreamHandler handles downloads from the /renter/stream endpoint
+func (api *API) renterStreamHandler(w http.ResponseWriter, req *http.Request, ps httprouter.Params) {
+	siaPath := strings.TrimPrefix(ps.ByName("siapath"), "/")
+	fileName, streamer, err := api.renter.Streamer(siaPath)
+	if err != nil {
+		WriteError(w, Error{fmt.Sprintf("failed to create download streamer: %v", err)},
+			http.StatusInternalServerError)
+		return
+	}
+	http.ServeContent(w, req, fileName, time.Time{}, streamer)
+}
+
 // renterUploadHandler handles the API call to upload a file.
 func (api *API) renterUploadHandler(w http.ResponseWriter, req *http.Request, ps httprouter.Params) {
 	source := req.FormValue("source")
@@ -552,7 +693,7 @@ func (api *API) renterUploadHandler(w http.ResponseWriter, req *http.Request, ps
 	if req.FormValue("datapieces") != "" || req.FormValue("paritypieces") != "" {
 		// Check that both values have been supplied.
 		if req.FormValue("datapieces") == "" || req.FormValue("paritypieces") == "" {
-			WriteError(w, Error{"must provide both the datapieces paramaeter and the paritypieces parameter if specifying erasure coding parameters"}, http.StatusBadRequest)
+			WriteError(w, Error{"must provide both the datapieces parameter and the paritypieces parameter if specifying erasure coding parameters"}, http.StatusBadRequest)
 			return
 		}
 

@@ -115,6 +115,9 @@ func (tpt *tpoolTester) Close() error {
 
 // TestIntegrationNewNilInputs tries to trigger a panic with nil inputs.
 func TestIntegrationNewNilInputs(t *testing.T) {
+	if testing.Short() {
+		t.SkipNow()
+	}
 	// Create a gateway and consensus set.
 	testdir := build.TempDir(modules.TransactionPoolDir, t.Name())
 	g, err := gateway.New("localhost:0", false, filepath.Join(testdir, modules.GatewayDir))
@@ -161,7 +164,10 @@ func TestGetTransaction(t *testing.T) {
 	value := types.NewCurrency64(35e6)
 	fee := types.NewCurrency64(3e2)
 	emptyUH := types.UnlockConditions{}.UnlockHash()
-	txnBuilder := tpt.wallet.StartTransaction()
+	txnBuilder, err := tpt.wallet.StartTransaction()
+	if err != nil {
+		t.Fatal(err)
+	}
 	err = txnBuilder.FundSiacoins(value)
 	if err != nil {
 		t.Fatal(err)

@@ -37,14 +37,13 @@ func TestContractUncommittedTxn(t *testing.T) {
 		},
 	}
 	initialRoots := []crypto.Hash{{1}}
-	id := initialHeader.ID()
-	_, err = cs.managedInsertContract(initialHeader, initialRoots)
+	c, err := cs.managedInsertContract(initialHeader, initialRoots)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// apply an update to the contract, but don't commit it
-	sc := cs.mustAcquire(t, id)
+	sc := cs.mustAcquire(t, c.ID)
 	revisedHeader := contractHeader{
 		Transaction: types.Transaction{
 			FileContractRevisions: []types.FileContractRevision{{
@@ -71,9 +70,13 @@ func TestContractUncommittedTxn(t *testing.T) {
 	// the state of the contract should match the initial state
 	// NOTE: can't use reflect.DeepEqual for the header because it contains
 	// types.Currency fields
+	merkleRoots, err := sc.merkleRoots.merkleRoots()
+	if err != nil {
+		t.Fatal("failed to get merkle roots", err)
+	}
 	if !bytes.Equal(encoding.Marshal(sc.header), encoding.Marshal(initialHeader)) {
 		t.Fatal("contractHeader should match initial contractHeader")
-	} else if !reflect.DeepEqual(sc.merkleRoots, initialRoots) {
+	} else if !reflect.DeepEqual(merkleRoots, initialRoots) {
 		t.Fatal("Merkle roots should match initial Merkle roots")
 	}
 
@@ -84,16 +87,20 @@ func TestContractUncommittedTxn(t *testing.T) {
 		t.Fatal(err)
 	}
 	// the uncommitted transaction should be stored in the contract
-	sc = cs.mustAcquire(t, id)
+	sc = cs.mustAcquire(t, c.ID)
 	if len(sc.unappliedTxns) != 1 {
 		t.Fatal("expected 1 unappliedTxn, got", len(sc.unappliedTxns))
 	} else if !bytes.Equal(sc.unappliedTxns[0].Updates[0].Instructions, walTxn.Updates[0].Instructions) {
 		t.Fatal("WAL transaction changed")
 	}
 	// the state of the contract should match the initial state
+	merkleRoots, err = sc.merkleRoots.merkleRoots()
+	if err != nil {
+		t.Fatal("failed to get merkle roots:", err)
+	}
 	if !bytes.Equal(encoding.Marshal(sc.header), encoding.Marshal(initialHeader)) {
 		t.Fatal("contractHeader should match initial contractHeader", sc.header, initialHeader)
-	} else if !reflect.DeepEqual(sc.merkleRoots, initialRoots) {
+	} else if !reflect.DeepEqual(merkleRoots, initialRoots) {
 		t.Fatal("Merkle roots should match initial Merkle roots")
 	}
 
@@ -107,9 +114,13 @@ func TestContractUncommittedTxn(t *testing.T) {
 		t.Fatal("expected 0 unappliedTxns, got", len(sc.unappliedTxns))
 	}
 	// the state of the contract should now match the revised state
+	merkleRoots, err = sc.merkleRoots.merkleRoots()
+	if err != nil {
+		t.Fatal("failed to get merkle roots:", err)
+	}
 	if !bytes.Equal(encoding.Marshal(sc.header), encoding.Marshal(revisedHeader)) {
 		t.Fatal("contractHeader should match revised contractHeader", sc.header, revisedHeader)
-	} else if !reflect.DeepEqual(sc.merkleRoots, revisedRoots) {
+	} else if !reflect.DeepEqual(merkleRoots, revisedRoots) {
 		t.Fatal("Merkle roots should match revised Merkle roots")
 	}
 }

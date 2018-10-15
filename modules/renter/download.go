@@ -104,7 +104,7 @@ package renter
 // That's going to need to be changed to a partial sector. This is probably
 // going to result in downloading that's 64-byte aligned instead of perfectly
 // byte-aligned. Further, the encryption and erasure coding may also have
-// alignment requirements which interefere with how the call to Sector can work.
+// alignment requirements which interfere with how the call to Sector can work.
 // So you need to make sure that in 'managedDownload' you download at least
 // enough data to fit the alignment requirements of all 3 steps (download from
 // host, encryption, erasure coding). After the logical data has been recovered,
@@ -155,12 +155,12 @@ type (
 		staticStartTime time.Time // Set immediately when the download object is created.
 
 		// Basic information about the file.
-		destination       downloadDestination
-		destinationString string // The string reported to the user to indicate the download's destination.
-		destinationType   string // "memory buffer", "http stream", "file", etc.
-		staticLength      uint64 // Length to download starting from the offset.
-		staticOffset      uint64 // Offset within the file to start the download.
-		staticSiaPath     string // The path of the siafile at the time the download started.
+		destination           downloadDestination
+		destinationString     string // The string reported to the user to indicate the download's destination.
+		staticDestinationType string // "memory buffer", "http stream", "file", etc.
+		staticLength          uint64 // Length to download starting from the offset.
+		staticOffset          uint64 // Offset within the file to start the download.
+		staticSiaPath         string // The path of the siafile at the time the download started.
 
 		// Retrieval settings for the file.
 		staticLatencyTarget time.Duration // In milliseconds. Lower latency results in lower total system throughput.
@@ -208,7 +208,10 @@ func (d *download) managedFail(err error) {
 	// Mark the download as complete and set the error.
 	d.err = err
 	close(d.completeChan)
-	err = d.destination.Close()
+	if d.destination != nil {
+		err = d.destination.Close()
+		d.destination = nil
+	}
 	if err != nil {
 		d.log.Println("unable to close download destination:", err)
 	}
@@ -233,9 +236,112 @@ func (d *download) Err() (err error) {
 	return err
 }
 
-// newDownload creates and initializes a download based on the provided
+// Download performs a file download using the passed parameters and blocks
+// until the download is finished.
+func (r *Renter) Download(p modules.RenterDownloadParameters) error {
+	d, err := r.managedDownload(p)
+	if err != nil {
+		return err
+	}
+	// Block until the download has completed
+	select {
+	case <-d.completeChan:
+		return d.Err()
+	case <-r.tg.StopChan():
+		return errors.New("download interrupted by shutdown")
+	}
+}
+
+// DownloadAsync performs a file download using the passed parameters without
+// blocking until the download is finished.
+func (r *Renter) DownloadAsync(p modules.RenterDownloadParameters) error {
+	_, err := r.managedDownload(p)
+	return err
+}
+
+// managedDownload performs a file download using the passed parameters and
+// returns the download object and an error that indicates if the download
+// setup was successful.
+func (r *Renter) managedDownload(p modules.RenterDownloadParameters) (*download, error) {
+	// Lookup the file associated with the nickname.
+	lockID := r.mu.RLock()
+	file, exists := r.files[p.SiaPath]
+	r.mu.RUnlock(lockID)
+	if !exists {
+		return nil, fmt.Errorf("no file with that path: %s", p.SiaPath)
+	}
+
+	// Validate download parameters.
+	isHTTPResp := p.Httpwriter != nil
+	if p.Async && isHTTPResp {
+		return nil, errors.New("cannot async download to http response")
+	}
+	if isHTTPResp && p.Destination != "" {
+		return nil, errors.New("destination cannot be specified when downloading to http response")
+	}
+	if !isHTTPResp && p.Destination == "" {
+		return nil, errors.New("destination not supplied")
+	}
+	if p.Destination != "" && !filepath.IsAbs(p.Destination) {
+		return nil, errors.New("destination must be an absolute path")
+	}
+	if p.Offset == file.size {
+		return nil, errors.New("offset equals filesize")
+	}
+	// Sentinel: if length == 0, download the entire file.
+	if p.Length == 0 {
+		p.Length = file.size - p.Offset
+	}
+	// Check whether offset and length is valid.
+	if p.Offset < 0 || p.Offset+p.Length > file.size {
+		return nil, fmt.Errorf("offset and length combination invalid, max byte is at index %d", file.size-1)
+	}
+
+	// Instantiate the correct downloadWriter implementation.
+	var dw downloadDestination
+	var destinationType string
+	if isHTTPResp {
+		dw = newDownloadDestinationWriteCloserFromWriter(p.Httpwriter)
+		destinationType = "http stream"
+	} else {
+		osFile, err := os.OpenFile(p.Destination, os.O_CREATE|os.O_WRONLY, os.FileMode(file.mode))
+		if err != nil {
+			return nil, err
+		}
+		dw = osFile
+		destinationType = "file"
+	}
+
+	// Create the download object.
+	d, err := r.managedNewDownload(downloadParams{
+		destination:       dw,
+		destinationType:   destinationType,
+		destinationString: p.Destination,
+		file:              file,
+
+		latencyTarget: 25e3 * time.Millisecond, // TODO: high default until full latency support is added.
+		length:        p.Length,
+		needsMemory:   true,
+		offset:        p.Offset,
+		overdrive:     3, // TODO: moderate default until full overdrive support is added.
+		priority:      5, // TODO: moderate default until full priority support is added.
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// Add the download object to the download queue.
+	r.downloadHistoryMu.Lock()
+	r.downloadHistory = append(r.downloadHistory, d)
+	r.downloadHistoryMu.Unlock()
+
+	// Return the download object
+	return d, nil
+}
+
+// managedNewDownload creates and initializes a download based on the provided
 // parameters.
-func (r *Renter) newDownload(params downloadParams) (*download, error) {
+func (r *Renter) managedNewDownload(params downloadParams) (*download, error) {
 	// Input validation.
 	if params.file == nil {
 		return nil, errors.New("no file provided when requesting download")
@@ -256,14 +362,15 @@ func (r *Renter) newDownload(params downloadParams) (*download, error) {
 
 		staticStartTime: time.Now(),
 
-		destination:         params.destination,
-		destinationString:   params.destinationString,
-		staticLatencyTarget: params.latencyTarget,
-		staticLength:        params.length,
-		staticOffset:        params.offset,
-		staticOverdrive:     params.overdrive,
-		staticSiaPath:       params.file.name,
-		staticPriority:      params.priority,
+		destination:           params.destination,
+		destinationString:     params.destinationString,
+		staticDestinationType: params.destinationType,
+		staticLatencyTarget:   params.latencyTarget,
+		staticLength:          params.length,
+		staticOffset:          params.offset,
+		staticOverdrive:       params.overdrive,
+		staticSiaPath:         params.file.name,
+		staticPriority:        params.priority,
 
 		log:           r.log,
 		memoryManager: r.memoryManager,
@@ -275,22 +382,22 @@ func (r *Renter) newDownload(params downloadParams) (*download, error) {
 
 	// For each chunk, assemble a mapping from the contract id to the index of
 	// the piece within the chunk that the contract is responsible for.
-	chunkMaps := make([]map[types.FileContractID]downloadPieceInfo, maxChunk-minChunk+1)
+	chunkMaps := make([]map[string]downloadPieceInfo, maxChunk-minChunk+1)
 	for i := range chunkMaps {
-		chunkMaps[i] = make(map[types.FileContractID]downloadPieceInfo)
+		chunkMaps[i] = make(map[string]downloadPieceInfo)
 	}
 	params.file.mu.Lock()
 	for id, contract := range params.file.contracts {
-		resolvedID := r.hostContractor.ResolveID(id)
+		resolvedKey := r.hostContractor.ResolveIDToPubKey(id)
 		for _, piece := range contract.Pieces {
 			if piece.Chunk >= minChunk && piece.Chunk <= maxChunk {
 				// Sanity check - the same worker should not have two pieces for
 				// the same chunk.
-				_, exists := chunkMaps[piece.Chunk-minChunk][resolvedID]
+				_, exists := chunkMaps[piece.Chunk-minChunk][string(resolvedKey.Key)]
 				if exists {
 					r.log.Println("ERROR: Worker has multiple pieces uploaded for the same chunk.")
 				}
-				chunkMaps[piece.Chunk-minChunk][resolvedID] = downloadPieceInfo{
+				chunkMaps[piece.Chunk-minChunk][string(resolvedKey.Key)] = downloadPieceInfo{
 					index: piece.Piece,
 					root:  piece.MerkleRoot,
 				}
@@ -309,6 +416,7 @@ func (r *Renter) newDownload(params downloadParams) (*download, error) {
 			masterKey:   params.file.masterKey,
 
 			staticChunkIndex: i,
+			staticCacheID:    fmt.Sprintf("%v:%v", d.staticSiaPath, i),
 			staticChunkMap:   chunkMaps[i-minChunk],
 			staticChunkSize:  params.file.staticChunkSize(),
 			staticPieceSize:  params.file.pieceSize,
@@ -329,7 +437,8 @@ func (r *Renter) newDownload(params downloadParams) (*download, error) {
 			physicalChunkData: make([][]byte, params.file.erasureCode.NumPieces()),
 			pieceUsage:        make([]bool, params.file.erasureCode.NumPieces()),
 
-			download: d,
+			download:          d,
+			staticStreamCache: r.staticStreamCache,
 		}
 
 		// Set the fetchOffset - the offset within the chunk that we start
@@ -367,92 +476,9 @@ func (r *Renter) newDownload(params downloadParams) (*download, error) {
 	return d, nil
 }
 
-// Download performs a file download using the passed parameters.
-func (r *Renter) Download(p modules.RenterDownloadParameters) error {
-	// Lookup the file associated with the nickname.
-	lockID := r.mu.RLock()
-	file, exists := r.files[p.SiaPath]
-	r.mu.RUnlock(lockID)
-	if !exists {
-		return fmt.Errorf("no file with that path: %s", p.SiaPath)
-	}
-
-	// Validate download parameters.
-	isHTTPResp := p.Httpwriter != nil
-	if p.Async && isHTTPResp {
-		return errors.New("cannot async download to http response")
-	}
-	if isHTTPResp && p.Destination != "" {
-		return errors.New("destination cannot be specified when downloading to http response")
-	}
-	if !isHTTPResp && p.Destination == "" {
-		return errors.New("destination not supplied")
-	}
-	if p.Destination != "" && !filepath.IsAbs(p.Destination) {
-		return errors.New("destination must be an absolute path")
-	}
-	if p.Offset == file.size {
-		return errors.New("offset equals filesize")
-	}
-	// Sentinel: if length == 0, download the entire file.
-	if p.Length == 0 {
-		p.Length = file.size - p.Offset
-	}
-	// Check whether offset and length is valid.
-	if p.Offset < 0 || p.Offset+p.Length > file.size {
-		return fmt.Errorf("offset and length combination invalid, max byte is at index %d", file.size-1)
-	}
-
-	// Instantiate the correct downloadWriter implementation.
-	var dw downloadDestination
-	var destinationType string
-	if isHTTPResp {
-		dw = newDownloadDestinationWriteCloserFromWriter(p.Httpwriter)
-		destinationType = "http stream"
-	} else {
-		osFile, err := os.OpenFile(p.Destination, os.O_CREATE|os.O_WRONLY, os.FileMode(file.mode))
-		if err != nil {
-			return err
-		}
-		dw = osFile
-		destinationType = "file"
-	}
-
-	// Create the download object.
-	d, err := r.newDownload(downloadParams{
-		destination:       dw,
-		destinationType:   destinationType,
-		destinationString: p.Destination,
-		file:              file,
-
-		latencyTarget: 25e3 * time.Millisecond, // TODO: high default until full latency support is added.
-		length:        p.Length,
-		needsMemory:   true,
-		offset:        p.Offset,
-		overdrive:     3, // TODO: moderate default until full overdrive support is added.
-		priority:      5, // TODO: moderate default until full priority support is added.
-	})
-	if err != nil {
-		return err
-	}
-
-	// Add the download object to the download queue.
-	r.downloadHistoryMu.Lock()
-	r.downloadHistory = append(r.downloadHistory, d)
-	r.downloadHistoryMu.Unlock()
-
-	// Block until the download has completed.
-	select {
-	case <-d.completeChan:
-		return d.Err()
-	case <-r.tg.StopChan():
-		return errors.New("download interrupted by shutdown")
-	}
-}
-
 // DownloadHistory returns the list of downloads that have been performed. Will
-// include downloads that have not yet completed. Downloads will be roughly, but
-// not precisely, sorted according to start time.
+// include downloads that have not yet completed. Downloads will be roughly,
+// but not precisely, sorted according to start time.
 //
 // TODO: Currently the DownloadHistory only contains downloads from this
 // session, does not contain downloads that were executed for the purposes of
@@ -471,7 +497,7 @@ func (r *Renter) DownloadHistory() []modules.DownloadInfo {
 		d.mu.Lock() // Lock required for d.endTime only.
 		downloads[i] = modules.DownloadInfo{
 			Destination:     d.destinationString,
-			DestinationType: d.destinationType,
+			DestinationType: d.staticDestinationType,
 			Length:          d.staticLength,
 			Offset:          d.staticOffset,
 			SiaPath:         d.staticSiaPath,
@@ -480,6 +506,7 @@ func (r *Renter) DownloadHistory() []modules.DownloadInfo {
 			EndTime:              d.endTime,
 			Received:             atomic.LoadUint64(&d.atomicDataReceived),
 			StartTime:            d.staticStartTime,
+			StartTimeUnix:        d.staticStartTime.UnixNano(),
 			TotalDataTransferred: atomic.LoadUint64(&d.atomicTotalDataTransferred),
 		}
 		// Release download lock before calling d.Err(), which will acquire the
@@ -493,4 +520,48 @@ func (r *Renter) DownloadHistory() []modules.DownloadInfo {
 		}
 	}
 	return downloads
+}
+
+// ClearDownloadHistory clears the renter's download history inclusive of the
+// provided before and after timestamps
+//
+// TODO: This function can be improved by implementing a binary search, the
+// trick will be making the binary search be just as readable while handling
+// all the edge cases
+func (r *Renter) ClearDownloadHistory(after, before time.Time) error {
+	if err := r.tg.Add(); err != nil {
+		return err
+	}
+	defer r.tg.Done()
+	r.downloadHistoryMu.Lock()
+	defer r.downloadHistoryMu.Unlock()
+
+	// Check to confirm there are downloads to clear
+	if len(r.downloadHistory) == 0 {
+		return nil
+	}
+
+	// Timestamp validation
+	if before.Before(after) {
+		return errors.New("before timestamp can not be newer then after timestamp")
+	}
+
+	// Clear download history if both before and after timestamps are zero values
+	if before.Equal(types.EndOfTime) && after.IsZero() {
+		r.downloadHistory = r.downloadHistory[:0]
+		return nil
+	}
+
+	// Find and return downloads that are not within the given range
+	withinTimespan := func(t time.Time) bool {
+		return (t.After(after) || t.Equal(after)) && (t.Before(before) || t.Equal(before))
+	}
+	filtered := r.downloadHistory[:0]
+	for _, d := range r.downloadHistory {
+		if !withinTimespan(d.staticStartTime) {
+			filtered = append(filtered, d)
+		}
+	}
+	r.downloadHistory = filtered
+	return nil
 }

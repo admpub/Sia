@@ -2,7 +2,6 @@ package api
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -19,6 +18,7 @@ import (
 	"github.com/NebulousLabs/Sia/modules/transactionpool"
 	"github.com/NebulousLabs/Sia/modules/wallet"
 	"github.com/NebulousLabs/Sia/types"
+	"github.com/NebulousLabs/errors"
 	"github.com/NebulousLabs/fastrand"
 )
 
@@ -119,7 +119,11 @@ func TestWalletEncrypt(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Check that the wallet actually unlocked.
-	if !st.wallet.Unlocked() {
+	unlocked, err := st.wallet.Unlocked()
+	if err != nil {
+		t.Error(err)
+	}
+	if !unlocked {
 		t.Error("wallet is not unlocked")
 	}
 
@@ -147,7 +151,11 @@ func TestWalletEncrypt(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Check that the wallet actually unlocked.
-	if !st2.wallet.Unlocked() {
+	unlocked, err = st2.wallet.Unlocked()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !unlocked {
 		t.Error("wallet is not unlocked")
 	}
 }
@@ -213,7 +221,11 @@ func TestWalletBlankEncrypt(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Check that the wallet actually unlocked.
-	if !w.Unlocked() {
+	unlocked, err := w.Unlocked()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !unlocked {
 		t.Error("wallet is not unlocked")
 	}
 }
@@ -296,7 +308,11 @@ func TestIntegrationWalletInitSeed(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Check that the wallet actually unlocked.
-	if !w.Unlocked() {
+	unlocked, err := w.Unlocked()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !unlocked {
 		t.Error("wallet is not unlocked")
 	}
 }
@@ -515,8 +531,11 @@ func TestIntegrationWalletLoadSeedPOST(t *testing.T) {
 	}
 
 	// Record starting balances.
-	oldBal, _, _ := st.wallet.ConfirmedBalance()
-	w2bal, _, _ := w2.ConfirmedBalance()
+	oldBal, _, _, err1 := st.wallet.ConfirmedBalance()
+	w2bal, _, _, err2 := w2.ConfirmedBalance()
+	if errs := errors.Compose(err1, err2); errs != nil {
+		t.Fatal(errs)
+	}
 	if w2bal.IsZero() {
 		t.Fatal("second wallet's balance should not be zero")
 	}
@@ -532,7 +551,10 @@ func TestIntegrationWalletLoadSeedPOST(t *testing.T) {
 		t.Fatal(err)
 	}
 	// First wallet should now have balance of both wallets
-	bal, _, _ := st.wallet.ConfirmedBalance()
+	bal, _, _, err := st.wallet.ConfirmedBalance()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if exp := oldBal.Add(w2bal); !bal.Equals(exp) {
 		t.Fatalf("wallet did not load seed correctly: expected %v coins, got %v", exp, bal)
 	}
@@ -655,6 +677,15 @@ func TestWalletTransactionGETid(t *testing.T) {
 	if len(wtg.UnconfirmedTransactions) != 2 {
 		t.Fatal("expecting two unconfirmed transactions in sender wallet")
 	}
+	// Check that undocumented API behaviour used in Sia-UI still works with
+	// current API.
+	err = st.getAPI("/wallet/transactions?startheight=0&endheight=-1", &wtg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(wtg.UnconfirmedTransactions) != 2 {
+		t.Fatal("expecting two unconfirmed transactions in sender wallet")
+	}
 	// Get the id of the non-change output sent to the receiving wallet.
 	expectedOutputID := wtg.UnconfirmedTransactions[1].Outputs[0].ID
 
@@ -665,7 +696,7 @@ func TestWalletTransactionGETid(t *testing.T) {
 		t.Fatal(err)
 	}
 	// There should be at least one unconfirmed transaction:
-	err = retry(50, time.Millisecond*100, func() error {
+	err = build.Retry(50, time.Millisecond*100, func() error {
 		if len(wtg.UnconfirmedTransactions) < 1 {
 			return errors.New("unconfirmed transaction not found")
 		}
@@ -1017,7 +1048,11 @@ func TestWalletReset(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Check that the wallet actually unlocked.
-	if !st.wallet.Unlocked() {
+	unlocked, err := st.wallet.Unlocked()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !unlocked {
 		t.Error("wallet is not unlocked")
 	}
 
@@ -1045,7 +1080,11 @@ func TestWalletReset(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Check that the wallet actually unlocked.
-	if !st2.wallet.Unlocked() {
+	unlocked, err = st2.wallet.Unlocked()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !unlocked {
 		t.Error("wallet is not unlocked")
 	}
 }
@@ -1257,7 +1296,11 @@ func TestWalletChangePassword(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Check that the wallet actually unlocked.
-	if !st.wallet.Unlocked() {
+	unlocked, err := st.wallet.Unlocked()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !unlocked {
 		t.Error("wallet is not unlocked")
 	}
 
@@ -1270,7 +1313,11 @@ func TestWalletChangePassword(t *testing.T) {
 		t.Fatal(err)
 	}
 	// wallet should still be unlocked
-	if !st.wallet.Unlocked() {
+	unlocked, err = st.wallet.Unlocked()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !unlocked {
 		t.Fatal("changepassword locked the wallet")
 	}
 
@@ -1285,7 +1332,11 @@ func TestWalletChangePassword(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Check that the wallet actually unlocked.
-	if !st.wallet.Unlocked() {
+	unlocked, err = st.wallet.Unlocked()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !unlocked {
 		t.Error("wallet is not unlocked")
 	}
 
@@ -1313,7 +1364,11 @@ func TestWalletChangePassword(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Check that the wallet actually unlocked.
-	if !st2.wallet.Unlocked() {
+	unlocked, err = st2.wallet.Unlocked()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !unlocked {
 		t.Error("wallet is not unlocked")
 	}
 }
@@ -1471,7 +1526,10 @@ func TestWalletGETDust(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	dt := st.wallet.DustThreshold()
+	dt, err := st.wallet.DustThreshold()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !dt.Equals(wg.DustThreshold) {
 		t.Fatal("dustThreshold mismatch")
 	}

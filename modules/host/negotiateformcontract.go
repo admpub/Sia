@@ -38,7 +38,10 @@ func (h *Host) managedAddCollateral(settings modules.HostExternalSettings, txnSe
 	parents := txnSet[:len(txnSet)-1]
 	fc := txn.FileContracts[0]
 	hostPortion := contractCollateral(settings, fc)
-	builder = h.wallet.RegisterTransaction(txn, parents)
+	builder, err = h.wallet.RegisterTransaction(txn, parents)
+	if err != nil {
+		return
+	}
 	err = builder.FundSiacoins(hostPortion)
 	if err != nil {
 		builder.Drop()
@@ -235,9 +238,9 @@ func (h *Host) managedVerifyNewContract(txnSet []types.Transaction, renterPK cry
 	if fc.WindowEnd < fc.WindowStart+eSettings.WindowSize {
 		return errSmallWindow
 	}
-	// WindowEnd must not be more than settings.MaxDuration blocks into the
+	// WindowStart must not be more than settings.MaxDuration blocks into the
 	// future.
-	if fc.WindowEnd > blockHeight+eSettings.MaxDuration {
+	if fc.WindowStart > blockHeight+eSettings.MaxDuration {
 		return errLongDuration
 	}
 

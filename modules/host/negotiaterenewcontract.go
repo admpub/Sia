@@ -51,7 +51,10 @@ func (h *Host) managedAddRenewCollateral(so storageObligation, settings modules.
 	parents := txnSet[:len(txnSet)-1]
 	fc := txn.FileContracts[0]
 	hostPortion := renewContractCollateral(so, settings, fc)
-	builder = h.wallet.RegisterTransaction(txn, parents)
+	builder, err = h.wallet.RegisterTransaction(txn, parents)
+	if err != nil {
+		return
+	}
 	err = builder.FundSiacoins(hostPortion)
 	if err != nil {
 		builder.Drop()
@@ -247,6 +250,11 @@ func (h *Host) managedVerifyRenewedContract(so storageObligation, txnSet []types
 	// WindowEnd must be at least settings.WindowSize blocks after WindowStart.
 	if fc.WindowEnd < fc.WindowStart+externalSettings.WindowSize {
 		return errSmallWindow
+	}
+	// WindowStart must not be more than settings.MaxDuration blocks into the
+	// future.
+	if fc.WindowStart > blockHeight+externalSettings.MaxDuration {
+		return errLongDuration
 	}
 
 	// ValidProofOutputs shoud have 2 outputs (renter + host) and missed

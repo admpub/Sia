@@ -71,6 +71,24 @@ func (g *Gateway) addPeer(p *peer) {
 	go g.threadedListenPeer(p)
 }
 
+// callInitRPCs calls the rpcs that are registered to be called upon connecting
+// to a peer.
+func (g *Gateway) callInitRPCs(addr modules.NetAddress) {
+	for name, fn := range g.initRPCs {
+		go func(name string, fn modules.RPCFunc) {
+			if g.threads.Add() != nil {
+				return
+			}
+			defer g.threads.Done()
+
+			err := g.managedRPC(addr, name, fn)
+			if err != nil {
+				g.log.Debugf("INFO: RPC %q on peer %q failed: %v", name, addr, err)
+			}
+		}(name, fn)
+	}
+}
+
 // randomOutboundPeer returns a random outbound peer.
 func (g *Gateway) randomOutboundPeer() (modules.NetAddress, error) {
 	// Get the list of outbound peers.
@@ -174,7 +192,7 @@ func (g *Gateway) managedAcceptConnPeer(conn net.Conn, remoteVersion string) err
 	g.mu.RLock()
 	ourHeader := sessionHeader{
 		GenesisID:  types.GenesisID,
-		UniqueID:   g.id,
+		UniqueID:   g.staticId,
 		NetAddress: g.myAddr,
 	}
 	g.mu.RUnlock()
@@ -217,7 +235,7 @@ func (g *Gateway) managedAcceptConnPeer(conn net.Conn, remoteVersion string) err
 	// do this in a goroutine so that we can begin communicating with the peer
 	// immediately.
 	go func() {
-		err := g.pingNode(remoteAddr)
+		err := g.staticPingNode(remoteAddr)
 		if err == nil {
 			g.mu.Lock()
 			g.addNode(remoteAddr)
@@ -273,7 +291,7 @@ func acceptableVersion(version string) error {
 	if !build.IsVersion(version) {
 		return invalidVersionError(version)
 	}
-	if build.VersionCmp(version, minAcceptableVersion) < 0 {
+	if build.VersionCmp(version, minimumAcceptablePeerVersion) < 0 {
 		return insufficientVersionError(version)
 	}
 	return nil
@@ -370,7 +388,7 @@ func (g *Gateway) managedConnectPeer(conn net.Conn, remoteVersion string, remote
 	g.mu.RLock()
 	ourHeader := sessionHeader{
 		GenesisID:  types.GenesisID,
-		UniqueID:   g.id,
+		UniqueID:   g.staticId,
 		NetAddress: g.myAddr,
 	}
 	g.mu.RUnlock()
@@ -407,7 +425,7 @@ func (g *Gateway) managedConnect(addr modules.NetAddress) error {
 	}
 
 	// Dial the peer and perform peer initialization.
-	conn, err := g.dial(addr)
+	conn, err := g.staticDial(addr)
 	if err != nil {
 		return err
 	}
@@ -456,19 +474,7 @@ func (g *Gateway) managedConnect(addr modules.NetAddress) error {
 	g.log.Debugln("INFO: connected to new peer", addr)
 
 	// call initRPCs
-	for name, fn := range g.initRPCs {
-		go func(name string, fn modules.RPCFunc) {
-			if g.threads.Add() != nil {
-				return
-			}
-			defer g.threads.Done()
-
-			err := g.managedRPC(addr, name, fn)
-			if err != nil {
-				g.log.Debugf("INFO: RPC %q on peer %q failed: %v", name, addr, err)
-			}
-		}(name, fn)
-	}
+	g.callInitRPCs(addr)
 
 	return nil
 }
